@@ -1,7 +1,10 @@
-# nixpacks.toml — pin the Python version used by Railway's builder
+# nixpacks.toml — Railway build configuration
 
 [phases.setup]
-nixPkgs = ["python310"]
+nixPkgs = ["python310", "python310Packages.pip", "python310Packages.setuptools"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = ["python -m pip install -r requirements.txt"]
+
+[start]
+cmd = "python main.py"
