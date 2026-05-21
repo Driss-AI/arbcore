@@ -1,0 +1,22 @@
+# ── ArbCore Dependencies ───────────────────────────────────
+# Python 3.10+
+
+# Exchange connectivity (REST + WebSocket)
+ccxt==4.4.54
+
+# Environment variable management
+python-dotenv==1.1.0
+
+# Async HTTP (used by ccxt.pro under the hood; pinned for stability)
+aiohttp==3.11.18
+
+# ── Observability & Monitoring ─────────────────────────────
+# Structured metrics (lightweight; optional upgrade to Prometheus later)
+
+# ── Testing ────────────────────────────────────────────────
+pytest==8.3.5
+pytest-asyncio==0.25.3
+pytest-cov==6.1.1
+
+# ── Dev / Linting (optional — install with `pip install -r requirements-dev.txt`) ─
+# ruff, mypy, pre-commit live in requirements-dev.txt
