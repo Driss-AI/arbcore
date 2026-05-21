@@ -1,10 +1,10 @@
 # nixpacks.toml — Railway build configuration
 
 [phases.setup]
-nixPkgs = ["python310", "python310Packages.pip", "python310Packages.setuptools"]
+nixPkgs = ["python310"]
 
 [phases.install]
-cmds = ["python -m pip install -r requirements.txt"]
+cmds = ["python -m ensurepip --upgrade", "python -m pip install -r requirements.txt"]
 
 [start]
 cmd = "python main.py"
