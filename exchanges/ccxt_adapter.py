@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional
 
-import ccxt.async_support as ccxt_async
+import ccxt.pro as ccxt_async
 
 from exchanges.base import (
     BaseExchangeAdapter,

@@ -30,7 +30,7 @@ async def create_adapters(
     -------
     Dict mapping exchange name → connected adapter.
     """
-    sandbox = settings.mode == "dry_run"
+    sandbox = False
     adapters: Dict[str, "BaseExchangeAdapter"] = {}
 
     for exchange_id in settings.enabled_exchanges:

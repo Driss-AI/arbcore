@@ -2,7 +2,7 @@
 # Python 3.10+
 
 # Exchange connectivity (REST + WebSocket)
-ccxt==4.4.54
+ccxt>=4.4.53,<5.0
 
 # Environment variable management
 python-dotenv==1.1.0
