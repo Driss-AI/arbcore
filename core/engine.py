@@ -4,28 +4,36 @@ Core Execution Engine
 Owns the main async loop: tick → fetch prices → detect opportunity →
 validate risk → execute (or skip) → log.
 
-Phase 3 additions:
-    • Multi-strategy support (spatial + triangular, selectable via config)
-    • WebSocket streaming mode (reads from in-memory cache instead of REST)
-    • Health monitor integration (exposes /health endpoint)
-    • Concurrent execution routing
+Phase 4 additions:
+    • Circuit breaker — hard kill-switch on API freeze / WS death
+    • Oracle CI filter — Pyth Network stale-quote confirmation
+    • Feed reconciler — REST vs WS book integrity checking
+    • Rate limiters — per-exchange token-bucket throttling
+    • Latency tracker — execution histogram for ALP detection
+    • Dynamic fee refresh — periodic re-fetch of taker fees
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from core.executor import Executor
 from core.health import HealthMonitor
+from data.oracle import OracleClient
+from data.feed_reconciler import FeedReconciler
 from exchanges.base import BaseExchangeAdapter, OrderBookSnapshot
 from exchanges.factory import create_adapters
 from exchanges.ws_manager import WebSocketManager
+from risk.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 from risk.manager import RiskManager
+from risk.rate_limiter import create_rate_limiters
 from strategies.base import BaseStrategy, Opportunity
+from strategies.filters import filter_by_feed_health, filter_by_oracle_ci
 from strategies.spatial import SpatialConfig, SpatialStrategy
 from strategies.triangular import TriangularConfig, TriangularStrategy
+from utils.latency_tracker import LatencyTracker
 from utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -40,14 +48,17 @@ class Engine:
 
     Lifecycle
     ---------
-    1.  ``start()`` — connects exchanges, launches WS/health, enters loop.
+    1.  ``start()`` — connects exchanges, launches services, enters loop.
     2.  Each *tick*:
-            a. Read snapshots (from WS cache or REST fetch).
-            b. Run all active strategies.
-            c. Gate opportunities through risk.
-            d. Route approved ones to the executor.
+            a. Circuit breaker gate (Phase 4).
+            b. Read snapshots (from WS cache or REST fetch).
+            c. Run all active strategies.
+            d. Apply oracle CI + feed health filters (Phase 4).
+            e. Gate opportunities through risk.
+            f. Route approved ones to the executor.
+            g. Feed latency data to tracker + breaker (Phase 4).
     3.  ``request_shutdown()`` → clean exit on next iteration.
-    4.  ``shutdown()`` → close WS streams, exchange connections, health server.
+    4.  ``shutdown()`` → close all services.
     """
 
     def __init__(self, settings: "Settings") -> None:
@@ -64,8 +75,16 @@ class Engine:
         self._health: Optional[HealthMonitor] = None
         self._symbols: List[str] = []
 
+        # Phase 4: New subsystems
+        self._circuit_breaker: Optional[CircuitBreaker] = None
+        self._oracle: Optional[OracleClient] = None
+        self._reconciler: Optional[FeedReconciler] = None
+        self._latency_tracker: Optional[LatencyTracker] = None
+        self._rate_limiters: Dict[str, Any] = {}
+
         # Fee cache: {exchange: {symbol: taker_fee}}
         self._fee_cache: Dict[str, Dict[str, float]] = {}
+        self._fee_cache_time: float = 0.0
 
         # Stats
         self._tick_count: int = 0
@@ -118,37 +137,84 @@ class Engine:
             concurrent=self._settings.concurrent_execution,
         )
 
-        # ── 7. Start WebSocket streams (if enabled) ──────
+        # ── 7. Phase 4: Circuit breaker ──────────────────
+        self._circuit_breaker = CircuitBreaker(CircuitBreakerConfig(
+            max_consecutive_api_failures=self._settings.risk.max_consecutive_api_failures,
+            max_order_latency_ms=self._settings.risk.max_order_latency_ms,
+            max_ws_silence_s=self._settings.risk.max_ws_silence_s,
+            max_unhedged_hold_s=self._settings.risk.max_unhedged_hold_s,
+            cooldown_s=self._settings.risk.circuit_breaker_cooldown_s,
+        ))
+        logger.info("Circuit breaker armed.")
+
+        # ── 8. Phase 4: Rate limiters ────────────────────
+        self._rate_limiters = create_rate_limiters(self._settings.enabled_exchanges)
+
+        # ── 9. Phase 4: Latency tracker ──────────────────
+        self._latency_tracker = LatencyTracker()
+
+        # ── 10. Start WebSocket streams (if enabled) ─────
         if self._settings.use_websocket:
             self._ws_manager = WebSocketManager(
                 adapters=self._adapters,
                 symbols=self._symbols,
             )
             await self._ws_manager.start()
-            # Give streams a moment to connect
             await asyncio.sleep(2.0)
             logger.info(
                 "WebSocket mode active — %d streams connected",
                 self._ws_manager.stream_count,
             )
 
-        # ── 8. Update health stats ───────────────────────
+        # ── 11. Phase 4: Oracle (if enabled) ─────────────
+        if self._settings.use_oracle:
+            self._oracle = OracleClient(
+                max_ci_pct=self._settings.oracle_max_ci_pct,
+                refresh_interval_s=self._settings.oracle_refresh_interval_s,
+            )
+            try:
+                await self._oracle.start()
+                logger.info(
+                    "Oracle integration active — Pyth CI filter enabled "
+                    "(max_ci=%.1f%%, refresh=%.1fs)",
+                    self._settings.oracle_max_ci_pct,
+                    self._settings.oracle_refresh_interval_s,
+                )
+            except Exception:
+                logger.warning("Oracle client failed to start — continuing without it.")
+                self._oracle = None
+
+        # ── 12. Phase 4: Feed reconciler (WS mode only) ──
+        if self._ws_manager:
+            self._reconciler = FeedReconciler(
+                adapters=self._adapters,
+                ws_manager=self._ws_manager,
+                symbols=self._symbols,
+                interval_s=self._settings.feed_reconcile_interval_s,
+                divergence_threshold_pct=self._settings.feed_desync_threshold_pct,
+            )
+            await self._reconciler.start()
+
+        # ── 13. Update health stats ──────────────────────
         if self._health:
             self._health.update_stats(
                 mode=self._settings.mode,
                 exchanges=self._settings.enabled_exchanges,
                 symbols_monitored=len(self._symbols),
                 strategies=strategy_names,
+                oracle_active=self._oracle is not None,
+                circuit_breaker="armed",
             )
 
-        # ── 9. Main loop ────────────────────────────────
+        # ── 14. Main loop ───────────────────────────────
         self._running = True
         logger.info(
-            "Engine started — mode=%s | poll=%.2fs | ws=%s | concurrent=%s",
+            "Engine started — mode=%s | poll=%.2fs | ws=%s | concurrent=%s | oracle=%s",
             self._settings.mode,
             self._settings.poll_interval_s,
             self._settings.use_websocket,
             self._settings.concurrent_execution,
+            self._oracle is not None,
         )
 
         while not self._shutdown_requested:
@@ -177,16 +243,33 @@ class Engine:
         tick_trades = 0
         tick_pnl = 0.0
 
+        # ── 0. Phase 4: Circuit breaker gate ─────────────
+        if self._circuit_breaker:
+            if self._reconciler:
+                self._circuit_breaker.update_desync_count(
+                    len(self._reconciler.desynced_feeds)
+                )
+            trip_reason = self._circuit_breaker.check()
+            if trip_reason:
+                logger.critical(
+                    "CIRCUIT BREAKER ACTIVE — halting engine: %s", trip_reason,
+                )
+                self._shutdown_requested = True
+                return
+
         # ── 1. Get snapshots ─────────────────────────────
         if self._ws_manager:
             snapshots = self._ws_manager.get_all_snapshots()
+            # Phase 4: Signal WS health to circuit breaker
+            if self._circuit_breaker and snapshots:
+                self._circuit_breaker.record_ws_data()
         else:
             snapshots = await self._fetch_all_books()
 
         if not snapshots:
             return
 
-        # ── 2. Get fees (cached) ─────────────────────────
+        # ── 2. Get fees (cached with TTL refresh) ────────
         fee_schedule = await self._fetch_all_fees()
 
         # ── 3. Run all active strategies ─────────────────
@@ -197,6 +280,22 @@ class Engine:
                 all_opportunities.extend(opps)
             except Exception:
                 logger.exception("Strategy %s crashed during scan", strategy.name)
+
+        # ── 3b. Phase 4: Apply oracle CI + feed health filters ──
+        pre_filter_count = len(all_opportunities)
+        all_opportunities = filter_by_oracle_ci(all_opportunities, self._oracle)
+        if self._reconciler:
+            all_opportunities = filter_by_feed_health(
+                all_opportunities, self._reconciler.desynced_feeds
+            )
+
+        if pre_filter_count > 0 and len(all_opportunities) < pre_filter_count:
+            logger.info(
+                "Phase 4 filters: %d → %d opportunities (rejected %d)",
+                pre_filter_count,
+                len(all_opportunities),
+                pre_filter_count - len(all_opportunities),
+            )
 
         # Sort globally by net profitability
         all_opportunities.sort(key=lambda o: o.net_pct, reverse=True)
@@ -231,6 +330,24 @@ class Engine:
             notional = sum(l.price * l.quantity for l in opp.legs)
             self._risk.record_fill(report.net_pnl_usd, notional)
 
+            # ── 4b. Phase 4: Feed data to circuit breaker + tracker ──
+            if self._circuit_breaker:
+                for fill in report.fills:
+                    if fill.success:
+                        self._circuit_breaker.record_api_success()
+                        self._circuit_breaker.record_order_latency(fill.latency_ms)
+                    else:
+                        self._circuit_breaker.record_api_failure()
+                if report.unhedged:
+                    self._circuit_breaker.record_unhedged_open()
+                elif not report.unhedged:
+                    self._circuit_breaker.record_unhedged_closed()
+
+            if self._latency_tracker:
+                for fill in report.fills:
+                    if fill.success:
+                        self._latency_tracker.record(fill.exchange, fill.latency_ms)
+
         # ── 5. Update health ─────────────────────────────
         if self._health:
             ws_streams = self._ws_manager.stream_count if self._ws_manager else 0
@@ -239,7 +356,31 @@ class Engine:
                 trades=tick_trades,
                 pnl_delta=tick_pnl,
             )
-            self._health.update_stats(ws_streams_active=ws_streams)
+            extra_stats: dict = {"ws_streams_active": ws_streams}
+            if self._circuit_breaker:
+                extra_stats["circuit_breaker"] = (
+                    "tripped" if self._circuit_breaker.is_tripped else "armed"
+                )
+            if self._oracle:
+                extra_stats["oracle_feeds"] = self._oracle.feed_count
+            if self._reconciler:
+                extra_stats["desynced_feeds"] = len(self._reconciler.desynced_feeds)
+            self._health.update_stats(**extra_stats)
+
+        # ── 6. Phase 4: Periodic ALP detection log ───────
+        if self._latency_tracker and self._tick_count % 100 == 0:
+            for ex_name in self._adapters:
+                stats = self._latency_tracker.get_stats(ex_name)
+                if stats and stats.suspected_floor_ms is not None:
+                    logger.warning(
+                        "ALP_ALERT | %s | suspected floor at %.0fms "
+                        "(mean=%.0fms median=%.0fms p95=%.0fms)",
+                        ex_name,
+                        stats.suspected_floor_ms,
+                        stats.mean_ms,
+                        stats.median_ms,
+                        stats.p95_ms,
+                    )
 
     # ── Strategy builder ─────────────────────────────────
 
@@ -278,6 +419,9 @@ class Engine:
                 return ex_name, symbol, await adapter.fetch_order_book(symbol)
             except Exception as exc:
                 logger.warning("Book fetch failed: %s/%s — %s", ex_name, symbol, exc)
+                # Phase 4: record failure to circuit breaker
+                if self._circuit_breaker:
+                    self._circuit_breaker.record_api_failure()
                 return ex_name, symbol, None
 
         tasks = [
@@ -296,21 +440,38 @@ class Engine:
             if snapshot is None:
                 continue
             result.setdefault(ex_name, {})[symbol] = snapshot
+            # Phase 4: record success
+            if self._circuit_breaker:
+                self._circuit_breaker.record_api_success()
 
         return result
 
     async def _fetch_all_fees(self) -> Dict[str, Dict[str, float]]:
-        """Fetch taker fees (cached for session lifetime)."""
+        """
+        Fetch taker fees with TTL-based cache refresh.
+
+        Phase 4: fees are refreshed periodically instead of cached forever,
+        since Tier-2 exchanges can change fee tiers without notice.
+        """
+        now = time.monotonic()
+        cache_expired = (
+            now - self._fee_cache_time > self._settings.fee_refresh_interval_s
+        )
+
         for ex_name, adapter in self._adapters.items():
             if ex_name not in self._fee_cache:
                 self._fee_cache[ex_name] = {}
             for sym in self._symbols:
-                if sym not in self._fee_cache[ex_name]:
+                if sym not in self._fee_cache[ex_name] or cache_expired:
                     try:
                         fee = await adapter.fetch_trading_fee(sym)
                         self._fee_cache[ex_name][sym] = fee
                     except Exception:
-                        self._fee_cache[ex_name][sym] = 0.001
+                        self._fee_cache[ex_name].setdefault(sym, 0.001)
+
+        if cache_expired:
+            self._fee_cache_time = now
+            logger.debug("Fee cache refreshed for all exchanges.")
 
         return self._fee_cache
 
@@ -338,6 +499,13 @@ class Engine:
         """Graceful teardown of all services."""
         logger.info("Engine shutdown sequence starting …")
 
+        # Phase 4: Stop new subsystems
+        if self._oracle:
+            await self._oracle.stop()
+
+        if self._reconciler:
+            await self._reconciler.stop()
+
         if self._ws_manager:
             await self._ws_manager.stop()
 
@@ -349,5 +517,23 @@ class Engine:
 
         if self._health:
             await self._health.stop()
+
+        # Phase 4: Log final latency stats
+        if self._latency_tracker:
+            for ex_name, stats in self._latency_tracker.get_all_stats().items():
+                logger.info(
+                    "LATENCY_SUMMARY | %s | n=%d mean=%.0fms median=%.0fms "
+                    "p95=%.0fms p99=%.0fms floor=%s",
+                    ex_name, stats.count, stats.mean_ms, stats.median_ms,
+                    stats.p95_ms, stats.p99_ms,
+                    f"{stats.suspected_floor_ms:.0f}ms" if stats.suspected_floor_ms else "none",
+                )
+
+        # Phase 4: Log circuit breaker history
+        if self._circuit_breaker and self._circuit_breaker.trip_history:
+            logger.warning(
+                "Circuit breaker tripped %d time(s) during session.",
+                len(self._circuit_breaker.trip_history),
+            )
 
         logger.info("Engine shutdown complete.")
